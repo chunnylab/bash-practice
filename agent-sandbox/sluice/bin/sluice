@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+
+__self=${BASH_SOURCE[0]}
+while [[ -L $__self ]]; do
+  __link=$(readlink -- "$__self")
+  [[ $__link == /* ]] || __link=${__self%/*}/$__link
+  __self=$__link
+done
+[[ $__self == */* ]] || __self=./$__self
+SLUICE_HOME=$(cd -P -- "${__self%/*}/.." && pwd)
+export SLUICE_HOME
+unset __self __link
+
+source "$SLUICE_HOME/lib/core.sh"
+core::import log json time dotenv lock pipeline scheduler render run
+
+declare -g OPT_ENV_FILE="" OPT_RUN=""
+declare -gi OPT_JOBS=0 OPT_DRY_RUN=0 OPT_FAIL_FAST=-1 OPT_STRICT=0 OPT_QUIET=0 OPT_WAIT_LOCK=0 OPT_RESEED=0 OPT_LIMIT=20
+declare -ga OPT_TARGETS=() OPT_ARGS=()
+
+cli::usage() {
+  cat <<'USAGE'
+sluice - DAG-driven ops pipelines in pure Bash
+
+Usage:
+  sluice run      [PIPELINE] [options]   execute a pipeline (default: pipelines/nightly-ops.ini)
+  sluice demo     [options]              seed a self-contained demo workspace and run nightly-ops on it
+  sluice plan     [PIPELINE]             show the execution plan, wave by wave
+  sluice graph    [PIPELINE] [--run ID]  print the dependency graph as Graphviz DOT
+  sluice validate [PIPELINE]             check a pipeline definition and the scripts it runs
+  sluice runs     [--limit N]            list recorded runs, newest first
+  sluice show     [RUN] [JOB]            summary of a run (default: latest), or one job's logs
+  sluice version
+  sluice help
+
+Run options:
+  -j, --jobs N           maximum parallel jobs (overrides max_parallel)
+  -t, --target JOB       run only JOB and what it depends on (repeatable)
+  -n, --dry-run          stages report what they would change, but change nothing
+  -k, --keep-going       never halt scheduling after a failure (overrides fail_fast)
+      --fail-fast        stop starting new jobs after the first failure
+      --strict           exit 1 when the run ends with warnings
+  -w, --wait-lock SEC    wait up to SEC seconds for a concurrent run to finish
+  -e, --env-file FILE    load configuration from FILE (default: .env in the install dir)
+  -l, --log-level LEVEL  trace | debug | info | warn | error
+  -q, --quiet            show only warnings and errors while running
+      --no-color         disable ANSI colours (NO_COLOR=1 works too)
+      --reseed           demo only: recreate the demo workspace from scratch
+
+Exit status:
+  0 ok or warnings   1 failed   64 usage error   65 invalid pipeline
+  75 another run holds the lock   78 configuration error   130/143 interrupted
+USAGE
+}
+
+cli::_usage_error() {
+  log::error "$1"
+  printf "Run 'sluice help' for usage.\n" >&2
+  exit "$EX_USAGE"
+}
+
+cli::parse() {
+  local a
+  while (( $# )); do
+    a=$1
+    case $a in
+      -j | --jobs | -t | --target | -e | --env-file | -l | --log-level | -w | --wait-lock | --limit | --run)
+        (( $# >= 2 )) || cli::_usage_error "option $a requires a value"
+        cli::_set "$a" "$2"
+        shift 2
+        ;;
+      --*=*)
+        cli::_set "${a%%=*}" "${a#*=}"
+        shift
+        ;;
+      -n | --dry-run) OPT_DRY_RUN=1; shift ;;
+      -k | --keep-going) OPT_FAIL_FAST=0; shift ;;
+      --fail-fast) OPT_FAIL_FAST=1; shift ;;
+      --strict) OPT_STRICT=1; shift ;;
+      -q | --quiet) OPT_QUIET=1; shift ;;
+      --no-color) export NO_COLOR=1; shift ;;
+      --reseed) OPT_RESEED=1; shift ;;
+      -h | --help) cli::usage; exit 0 ;;
+      --)
+        shift
+        OPT_ARGS+=("$@")
+        break
+        ;;
+      -[jtelw]?*) set -- "${a:0:2}" "${a:2}" "${@:2}" ;;
+      -[nkqh]?*) set -- "${a:0:2}" "-${a:2}" "${@:2}" ;;
+      -*) cli::_usage_error "unknown option '$a'" ;;
+      *)
+        OPT_ARGS+=("$a")
+        shift
+        ;;
+    esac
+  done
+}
+
+cli::_set() {
+  case $1 in
+    -j | --jobs)
+      [[ $2 =~ ^[1-9][0-9]*$ ]] || cli::_usage_error "--jobs expects a positive integer (got '$2')"
+      OPT_JOBS=$2
+      ;;
+    -t | --target) OPT_TARGETS+=("$2") ;;
+    -e | --env-file) OPT_ENV_FILE=$2 ;;
+    -l | --log-level) export SLUICE_LOG_LEVEL=$2 ;;
+    -w | --wait-lock)
+      [[ $2 =~ ^[0-9]+$ ]] || cli::_usage_error "--wait-lock expects seconds (got '$2')"
+      OPT_WAIT_LOCK=$2
+      ;;
+    --limit)
+      [[ $2 =~ ^[1-9][0-9]*$ ]] || cli::_usage_error "--limit expects a positive integer (got '$2')"
+      OPT_LIMIT=$2
+      ;;
+    --run) OPT_RUN=$2 ;;
+    *) cli::_usage_error "unknown option '$1'" ;;
+  esac
+}
+
+cli::bootstrap() {
+  local env_file=${OPT_ENV_FILE:-$SLUICE_HOME/.env}
+  if [[ -n $OPT_ENV_FILE && ! -r $OPT_ENV_FILE ]]; then
+    core::die "env file not readable: $OPT_ENV_FILE" "$EX_CONFIG"
+  fi
+  if [[ -r $env_file ]]; then
+    dotenv::load "$env_file" || exit "$EX_CONFIG"
+  fi
+  export SLUICE_VAR_DIR=${SLUICE_VAR_DIR:-$SLUICE_HOME/var}
+  export SLUICE_WORKSPACE=${SLUICE_WORKSPACE:-$SLUICE_VAR_DIR/workspace}
+  log::configure
+  render::init
+  if (( OPT_QUIET )); then
+    __LOG_MIN=${__LOG_RANK[warn]}
+  fi
+}
+
+cli::load_pipeline() {
+  (( ${#OPT_ARGS[@]} <= 1 )) || cli::_usage_error "expected at most one PIPELINE argument"
+  pipeline::load "${OPT_ARGS[0]:-$SLUICE_HOME/pipelines/nightly-ops.ini}" || exit "$EX_DATAERR"
+}
+
+cli::execute() {
+  local lock rel
+  local -i parallel=$PIPE_MAX_PARALLEL fail_fast=$PIPE_FAIL_FAST rc
+
+  pipeline::apply_env || exit "$EX_CONFIG"
+  pipeline::resolve_commands || exit "$EX_CONFIG"
+  if (( ${#OPT_TARGETS[@]} )); then
+    pipeline::select "${OPT_TARGETS[@]}" || exit "$EX_USAGE"
+  fi
+  (( OPT_JOBS == 0 )) || parallel=$OPT_JOBS
+  (( OPT_FAIL_FAST < 0 )) || fail_fast=$OPT_FAIL_FAST
+  export SLUICE_DRY_RUN=$OPT_DRY_RUN
+
+  mkdir -p -- "$SLUICE_VAR_DIR/lock" "$SLUICE_VAR_DIR/runs" "$SLUICE_WORKSPACE"
+  lock=$SLUICE_VAR_DIR/lock/$PIPE_NAME.lock
+  if ! lock::acquire "$lock" "$OPT_WAIT_LOCK"; then
+    log::error "another '$PIPE_NAME' run is in progress (lock: $lock); retry later or pass --wait-lock SEC"
+    exit "$EX_TEMPFAIL"
+  fi
+
+  run::begin "${PIPE_ORDER[@]}"
+  log::info "run started" pipeline="$PIPE_NAME" run="$RUN_ID" jobs="${#PIPE_ORDER[@]}" \
+    parallel="$parallel" fail_fast="$fail_fast" dry_run="$OPT_DRY_RUN"
+  sched::run "$RUN_DIR" "$parallel" "$fail_fast" "${PIPE_ORDER[@]}"
+  run::end "$OPT_STRICT"
+  rc=$REPLY
+
+  render::summary "$RUN_DIR"
+  if [[ -r $RUN_DIR/artifacts/report/report.md ]]; then
+    printf '  report   %s\n' "${RUN_DIR#"$PWD/"}/artifacts/report/report.md"
+  fi
+  if [[ ${SCHED_STATE[publish]-} == ok && -n ${SLUICE_PUBLISH_ROOT-} ]]; then
+    rel=$SLUICE_PUBLISH_ROOT/current/index.html
+    printf '  page     %s\n' "${rel#"$PWD/"}"
+  fi
+  printf '  details  sluice show %s [JOB]\n\n' "$RUN_ID"
+  log::info "run finished" status="$RUN_STATUS" exit="$rc"
+  exit "$rc"
+}
+
+cmd::run() {
+  cli::parse "$@"
+  cli::bootstrap
+  cli::load_pipeline
+  cli::execute
+}
+
+cmd::demo() {
+  cli::parse "$@"
+  (( ${#OPT_ARGS[@]} == 0 )) || cli::_usage_error "demo takes no PIPELINE argument"
+  cli::bootstrap
+  core::import demo
+  export SLUICE_WORKSPACE=$SLUICE_VAR_DIR/demo
+  unset SLUICE_ACCESS_LOGS SLUICE_SSHD_CONFIG SLUICE_FS_AUDIT_PATHS SLUICE_CERT_PATHS \
+    SLUICE_CERT_ENDPOINTS SLUICE_BACKUP_SOURCES SLUICE_BACKUP_DIR SLUICE_PUBLISH_ROOT \
+    SLUICE_PUBLISH_HEALTHCHECK
+  demo::seed "$SLUICE_WORKSPACE" "$OPT_RESEED"
+  cli::load_pipeline
+  cli::execute
+}
+
+cmd::plan() {
+  cli::parse "$@"
+  cli::bootstrap
+  cli::load_pipeline
+  render::plan
+}
+
+cmd::validate() {
+  local job
+  local -a argv=()
+  local -i bad=0
+  cli::parse "$@"
+  cli::bootstrap
+  cli::load_pipeline
+  pipeline::apply_env || exit "$EX_CONFIG"
+  pipeline::resolve_commands || exit "$EX_CONFIG"
+  for job in "${PIPE_JOBS[@]}"; do
+    sched::_argv "$job" argv
+    if [[ ${argv[0]} == "$BASH" ]]; then
+      if [[ ! -r ${argv[1]} ]]; then
+        log::error "job '$job': script not found: ${argv[1]}"
+        bad=1
+      fi
+    elif ! core::have "${argv[0]}"; then
+      log::error "job '$job': command not found: ${argv[0]}"
+      bad=1
+    fi
+  done
+  (( bad == 0 )) || exit "$EX_DATAERR"
+  local -i waves=0
+  for job in "${PIPE_ORDER[@]}"; do
+    (( PIPE_LEVEL[$job] <= waves )) || waves=${PIPE_LEVEL[$job]}
+  done
+  printf '%s: OK (%d jobs, %d waves)\n' "${PIPE_FILE#"$PWD/"}" "${#PIPE_JOBS[@]}" "$waves"
+}
+
+cmd::graph() {
+  local dir=""
+  cli::parse "$@"
+  cli::bootstrap
+  cli::load_pipeline
+  if [[ -n $OPT_RUN ]]; then
+    run::resolve "$OPT_RUN" || exit "$EX_USAGE"
+    dir=$REPLY
+  fi
+  render::dot "$dir"
+}
+
+cmd::runs() {
+  cli::parse "$@"
+  cli::bootstrap
+  run::list "$OPT_LIMIT"
+}
+
+cmd::show() {
+  local dir job f state rc att start end note
+  cli::parse "$@"
+  cli::bootstrap
+  run::resolve "${OPT_ARGS[0]:-latest}" || exit "$EX_USAGE"
+  dir=$REPLY
+  job=${OPT_ARGS[1]:-}
+  if [[ -z $job ]]; then
+    render::summary "$dir"
+    if [[ -r $dir/artifacts/report/report.md ]]; then
+      printf '  report   %s\n\n' "${dir#"$PWD/"}/artifacts/report/report.md"
+    fi
+    return 0
+  fi
+  [[ -d $dir/jobs/$job ]] || core::die "run ${dir##*/} has no job '$job'" "$EX_USAGE"
+  if IFS=$'\t' read -r state rc att start end note 2>/dev/null < "$dir/jobs/$job/status"; then
+    time::fmt_duration $(( end - start ))
+    printf '%s: %s (exit %s, %s attempt(s), %s)%s\n' "$job" "$state" "$rc" "$att" "$REPLY" "${note:+ - $note}"
+  fi
+  for f in stdout.log stderr.log; do
+    printf '\n==> %s <==\n' "$f"
+    if [[ -s $dir/jobs/$job/$f ]]; then
+      cat -- "$dir/jobs/$job/$f"
+    else
+      printf '(empty)\n'
+    fi
+  done
+}
+
+cmd::version() {
+  printf 'sluice %s (bash %s, %s)\n' "$SLUICE_VERSION" "$BASH_VERSION" "$OSTYPE"
+}
+
+cli::main() {
+  local cmd=${1:-help}
+  (( $# == 0 )) || shift
+  case $cmd in
+    run | demo | plan | graph | validate | runs | show) "cmd::$cmd" "$@" ;;
+    version | -V | --version) cmd::version ;;
+    help | -h | --help) cli::usage ;;
+    *)
+      log::error "unknown command '$cmd'"
+      cli::usage >&2
+      exit "$EX_USAGE"
+      ;;
+  esac
+}
+
+cli::main "$@"

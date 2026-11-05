@@ -1,0 +1,4 @@
+# Runtime state: run history, locks, demo workspace, backups.
+/var/
+# Local configuration may hold secrets such as webhook URLs.
+/.env

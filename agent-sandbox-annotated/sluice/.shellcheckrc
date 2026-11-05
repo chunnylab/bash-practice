@@ -1,0 +1,21 @@
+# ShellCheck project configuration (https://www.shellcheck.net).
+# Run from the project root:  shellcheck bin/sluice lib/*.sh stages/*.sh tests/*.sh tests/*/*.sh
+shell=bash
+
+# Modules are sourced through core::import with computed paths, which static
+# analysis cannot follow.
+disable=SC1090
+disable=SC1091
+
+# Globals are shared across files on purpose (PIPE_*, JOB_*, RENDER_ICON, EX_*)
+# and many names are reached through namerefs or ${!name}, invisible to a
+# per-file analysis.
+disable=SC2034
+
+# Associative-array subscripts need their '$' even in arithmetic context:
+# (( LEVEL[$job] )) looks up the key held in $job, (( LEVEL[job] )) the key "job".
+disable=SC2004
+
+# '$' inside single quotes is intentional: ${VAR} templates for the pipeline
+# engine and literal expected values in tests.
+disable=SC2016
