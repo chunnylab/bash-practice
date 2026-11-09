@@ -22,7 +22,6 @@ else
         if cat > "testfile_$i.sh" <<EOF
 #!/bin/bash
 echo "testfile_$i.sh say : I am file $i"
-date
 EOF
     then
         chmod +x "testfile_$i.sh"
