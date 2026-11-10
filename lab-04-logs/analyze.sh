@@ -1,57 +1,31 @@
 #!/bin/bash
-
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+echo "$DIR"
+
 usage() {
-    # TODO: echo วิธีใช้ ไปที่ stderr   เช่น  usage: analyze.sh <logfile> [top_n]
-    :
+    echo "usage: analyze.sh <logfile> [top_n]" >&2
 }
 
 report_top_ips() {
     local file=$1
     local top=$2
-    # TODO: pipeline ที่คุณเล่นใน terminal ไปแล้ว (ใช้ $top แทนเลข 5)
-    :
+    awk '{ print $1 }' "$file" | sort | uniq -c | sort -rn | head -n "$top"
 }
+
+file=${1:-$DIR/access.log}
+top=${2:-5}
 
 report_status() {
     local file=$1
-    # TODO: นับ status ($9) พร้อมเปอร์เซ็นต์ ด้วย awk
-    :
+    awk '{ count[$9]++ }
+         END {
+             for (s in count)
+                 printf "%s %d %.1f%%\n", s, count[s], count[s] / NR * 100
+         }' "$file" | sort
 }
 
-report_error_urls() {
-    local file=$1
-    local top=$2
-    # TODO: เลือกบรรทัดที่ status >= 400 แล้วนับ URL ($7)
-    :
-}
+usage
+report_top_ips "$file" "$top"
+report_status "$file"
 
-report_summary() {
-    local file=$1
-    # TODO: จำนวน request ทั้งหมด, bytes รวม, bytes เฉลี่ย (awk ตัวเดียว)
-    :
-}
-
-main() {
-    local file=$1
-    local top=${2:-5}
-
-    # TODO: ตรวจ argument  (ไม่มี $1 → usage + exit 1)
-    # TODO: ตรวจไฟล์       (ไม่มีไฟล์ / ไฟล์ว่าง → error + exit 1)
-    # TODO: ตรวจ top      (เป็นเลขบวกไหม)
-
-    echo "== summary"
-    report_summary "$file"
-
-    echo "== top $top IPs"
-    report_top_ips "$file" "$top"
-
-    echo "== status codes"
-    report_status "$file"
-
-    echo "== top $top error URLs"
-    report_error_urls "$file" "$top"
-}
-
-main "$@"
