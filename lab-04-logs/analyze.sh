@@ -25,7 +25,14 @@ report_status() {
          }' "$file" | sort
 }
 
-usage
-report_top_ips "$file" "$top"
-report_status "$file"
+report_error_urls() {
+    local file=$1
+    local top=$2
+    # TODO: เลือกบรรทัดที่ status >= 400 แล้วนับ URL ($7)
+    awk '$9 == 404 {print "$9"}'
+}
 
+#usage
+#report_top_ips "$file" "$top"
+#report_status "$file"
+report_error_urls "$file" "$top"
